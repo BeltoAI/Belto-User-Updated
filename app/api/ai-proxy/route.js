@@ -18,10 +18,10 @@ const endpointStats = endpoints.map(url => ({
   consecutiveFailures: 0
 }));
 
-const TIMEOUT_MS = 60000; // 60 seconds timeout
-const MAX_CONSECUTIVE_FAILURES = 3; // Number of failures before marking endpoint as unavailable
-const RETRY_INTERVAL_MS = 60000; // Try unavailable endpoints again after 1 minute
-const HEALTH_CHECK_THRESHOLD = 300000; // 5 minutes in ms
+const TIMEOUT_MS = 15000; // 15 seconds timeout (optimized for Vercel free tier)
+const MAX_CONSECUTIVE_FAILURES = 2; // Number of failures before marking endpoint as unavailable
+const RETRY_INTERVAL_MS = 15000; // Try unavailable endpoints again after 15 seconds
+const HEALTH_CHECK_THRESHOLD = 60000; // 1 minute for faster response (Vercel optimized)
 
 /**
  * Selects the best endpoint based on availability and response time
@@ -107,16 +107,19 @@ async function healthCheck() {
     if (!endpoint) return;
     
     try {
-      const startTime = Date.now();
-      // Try to access a lightweight health endpoint if available,
-      // fallback to a simple HEAD request to the main endpoint
-      await axios.head(url, {
-        timeout: 5000, // Short timeout for health check
+      const startTime = Date.now();      // Use a simple connectivity test with shorter timeout
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2000); // Reduced to 2 seconds
+      
+      await fetch(url.replace('/chat/completions', ''), {
+        method: 'HEAD',
+        signal: controller.signal,
         headers: { 
           'Content-Type': 'application/json' 
         }
       });
       
+      clearTimeout(timeoutId);
       const responseTime = Date.now() - startTime;
       updateEndpointStats(url, true, responseTime);
       console.log(`Health check for ${url}: OK (${responseTime}ms)`);
@@ -129,18 +132,30 @@ async function healthCheck() {
   await Promise.allSettled(checks);
 }
 
-// Periodically check endpoints health
-setInterval(() => {
-  const now = Date.now();
-  // Only perform health check if enough time has passed since the last check
-  const needsCheck = endpointStats.some(
-    endpoint => now - endpoint.lastChecked > HEALTH_CHECK_THRESHOLD
-  );
-  
-  if (needsCheck) {
-    healthCheck();
+// Periodically check endpoints health - only in serverless environment when needed
+let healthCheckInterval = null;
+
+// Initialize health checking if not already running
+function initializeHealthCheck() {
+  if (!healthCheckInterval && typeof setInterval !== 'undefined') {
+    healthCheckInterval = setInterval(() => {
+      const now = Date.now();
+      // Only perform health check if enough time has passed since the last check
+      const needsCheck = endpointStats.some(
+        endpoint => now - endpoint.lastChecked > HEALTH_CHECK_THRESHOLD
+      );
+      
+      if (needsCheck) {
+        healthCheck().catch(error => {
+          console.error('Health check failed:', error);
+        });
+      }
+    }, HEALTH_CHECK_THRESHOLD / 2); // Check twice as often as the threshold
   }
-}, HEALTH_CHECK_THRESHOLD);
+}
+
+// Initialize on module load
+initializeHealthCheck();
 
 export async function POST(request) {
   console.log('POST request received to AI proxy');
@@ -263,89 +278,190 @@ export async function POST(request) {
     };
 
     console.log('Request payload structure:', Object.keys(aiRequestPayload));
-    console.log('Message count:', aiRequestPayload.messages.length);
+    console.log('Message count:', aiRequestPayload.messages.length);    // Try multiple endpoints if needed
+    let lastError = null;
+    let attemptCount = 0;
+    const maxAttempts = Math.min(2, endpoints.length); // Reduced to 2 attempts for faster response
     
-    // Select the best endpoint using our load balancing algorithm instead of round-robin
-    const selectedEndpoint = selectEndpoint();
-    console.log(`Selected endpoint for request: ${selectedEndpoint}`);
-    
-    // Start timing the request for performance tracking
-    const requestStartTime = Date.now();
+    while (attemptCount < maxAttempts) {
+      attemptCount++;
+      
+      try {
+        // Select the best endpoint using our load balancing algorithm
+        const selectedEndpoint = selectEndpoint();
+        console.log(`Attempt ${attemptCount}: Selected endpoint ${selectedEndpoint}`);
+        
+        // Start timing the request for performance tracking
+        const requestStartTime = Date.now();
 
-    // Make the AI API call with API key in headers
-    const response = await axios.post(
-      selectedEndpoint,
-      aiRequestPayload,
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${apiKey}`,
-        },
-        timeout: TIMEOUT_MS,
+        // Create abort controller for manual timeout control
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => {
+          controller.abort();
+          console.log(`Request timeout after ${TIMEOUT_MS}ms for ${selectedEndpoint}`);
+        }, TIMEOUT_MS);
+
+        // Make the AI API call with API key in headers
+        const response = await axios.post(
+          selectedEndpoint,
+          aiRequestPayload,
+          {
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${apiKey}`,
+            },
+            timeout: TIMEOUT_MS,
+            signal: controller.signal,
+          }
+        );
+
+        clearTimeout(timeoutId);
+
+        // Calculate response time and update endpoint stats for success
+        const responseTime = Date.now() - requestStartTime;
+        updateEndpointStats(selectedEndpoint, true, responseTime);
+
+        console.log(`AI response received with status: ${response.status}, time: ${responseTime}ms`);
+
+        return NextResponse.json({
+          response: response.data.choices?.[0]?.message?.content || 'No response content',
+          tokenUsage: response.data.usage || {
+            total_tokens: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0
+          }
+        });
+        
+      } catch (error) {
+        lastError = error;
+        
+        // Update endpoint stats for failures
+        if (error.config?.url) {
+          updateEndpointStats(error.config.url, false, 0);
+          console.log(`Attempt ${attemptCount} failed for ${error.config.url}: ${error.message}`);
+        }
+        
+        // If this isn't the last attempt, wait briefly before retrying
+        if (attemptCount < maxAttempts) {
+          console.log(`Retrying in 500ms... (attempt ${attemptCount + 1}/${maxAttempts})`);
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
       }
-    );
-
-    // Calculate response time and update endpoint stats for future load balancing decisions
-    const responseTime = Date.now() - requestStartTime;
-    updateEndpointStats(selectedEndpoint, true, responseTime);
-
-    console.log(`AI response received with status: ${response.status}, time: ${responseTime}ms`);
-
-    return NextResponse.json({
-      response: response.data.choices?.[0]?.message?.content || 'No response content',
-      tokenUsage: response.data.usage || {
-        total_tokens: 0,
-        prompt_tokens: 0,
-        completion_tokens: 0
-      }
-    });
-  } catch (error) {
-    // Update endpoint stats for failures if we know which endpoint failed
-    if (error.config?.url) {
-      updateEndpointStats(error.config.url, false, 0);
-      console.log(`Updated stats for ${error.config.url} to reflect failure`);
     }
-
+    
+    // If all attempts failed, throw the last error to be handled by the outer catch block
+    throw lastError;  } catch (error) {
     // Log detailed error information
-    console.error('AI API Error:', {
+    console.error('AI API Error after all attempts:', {
       message: error.message,
       status: error.response?.status,
       data: error.response?.data,
       code: error.code,
       url: error.config?.url,
-      requestBody: error.config?.data ? JSON.parse(error.config.data) : 'No request body'
-    });
-
-    // Provide more specific error messages based on the error type
+      attempts: error.attempts || 'unknown'
+    });    // Provide more specific error messages based on the error type
     let errorMessage = 'Failed to generate AI response';
     let statusCode = 500;
-    let errorDetails = {
-      message: error.message,
-      code: error.code,
-      status: error.response?.status
-    };
-
-    if (error.code === 'ECONNREFUSED' || error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT') {
-      errorMessage = 'Could not connect to AI service. The service might be down or unreachable.';
+    let fallbackResponse = null;
+    
+    if (error.code === 'ECONNREFUSED' || error.code === 'ECONNABORTED' || 
+        error.code === 'ETIMEDOUT' || error.name === 'AbortError' ||
+        (error.response?.status >= 504 && error.response?.status <= 599)) {
+      errorMessage = 'AI service is temporarily unavailable due to timeout or connectivity issues.';
       statusCode = 503; // Service Unavailable
+      fallbackResponse = "I apologize, but I'm currently experiencing connectivity issues. The AI service is taking longer than expected to respond. Please try sending your message again in a moment.";
     } else if (error.response?.status === 401) {
-      errorMessage = 'Authentication failed with the AI service. Please check API key configuration.';
+      errorMessage = 'Authentication issue with AI service.';
       statusCode = 500;
+      fallbackResponse = "I'm experiencing authentication issues. Please contact support if this continues.";
     } else if (error.response?.status === 400) {
-      errorMessage = 'The AI service rejected the request. Check the request format.';
+      errorMessage = 'Invalid request format.';
       statusCode = 400;
+      fallbackResponse = "I had trouble understanding your request. Could you please rephrase it?";
+    } else if (error.response?.status === 429) {
+      errorMessage = 'AI service rate limit exceeded.';
+      statusCode = 429;
+      fallbackResponse = "I'm currently handling many requests. Please wait a moment and try again.";
+    } else if (error.response?.status === 504) {
+      errorMessage = 'AI service gateway timeout. The request took too long to process.';
+      statusCode = 504;
+      fallbackResponse = "Your request is taking longer than expected to process. This might be due to high server load. Please try again with a shorter message or wait a moment before retrying.";
     } else if (error.response?.data?.error) {
       errorMessage = `AI service error: ${error.response.data.error.message || 'Unknown error'}`;
+      fallbackResponse = "I encountered an unexpected error while processing your request. Please try again.";    } else if (error.message?.includes('timeout')) {
+      errorMessage = 'Request timeout - AI service took too long to respond.';
+      statusCode = 504;
+      fallbackResponse = "I apologize, but I'm currently experiencing connectivity issues. The AI service is taking longer than expected to respond. Please try sending your message again in a moment.";
     }
 
-    return NextResponse.json(
-      { 
-        error: errorMessage, 
-        details: errorDetails,
-        timestamp: new Date().toISOString()
+    // Return a user-friendly response instead of just an error
+    return NextResponse.json({
+      response: fallbackResponse || "I apologize, but I'm unable to process your request right now. Please try again later.",
+      tokenUsage: {
+        total_tokens: 0,
+        prompt_tokens: 0,
+        completion_tokens: 0
       },
-      { status: statusCode }
-    );
+      isError: true,
+      errorDetails: {
+        message: errorMessage,
+        code: error.code,
+        status: error.response?.status,
+        timestamp: new Date().toISOString()
+      }
+    }, { status: 200 }); // Return 200 so the chat doesn't break, but include error info
+  }
+}
+
+export async function GET(request) {
+  try {
+    console.log('Health check request to AI proxy');
+    
+    // Quick health check of endpoints
+    const healthResults = await Promise.allSettled(
+      endpoints.map(async (url) => {
+        const endpoint = endpointStats.find(e => e.url === url);
+        try {
+          const controller = new AbortController();
+          const timeoutId = setTimeout(() => controller.abort(), 2000);
+          
+          const response = await fetch(url.replace('/chat/completions', ''), {
+            method: 'HEAD',
+            signal: controller.signal,
+            headers: { 'Content-Type': 'application/json' }
+          });
+          
+          clearTimeout(timeoutId);
+          return {
+            url,
+            status: 'available',
+            responseTime: endpoint?.lastResponseTime || 0,
+            consecutiveFailures: endpoint?.consecutiveFailures || 0
+          };
+        } catch (error) {
+          return {
+            url,
+            status: 'unavailable',
+            error: error.message,
+            consecutiveFailures: endpoint?.consecutiveFailures || 0
+          };
+        }
+      })
+    );    return NextResponse.json({
+      status: 'ok',
+      timestamp: new Date().toISOString(),
+      endpoints: healthResults.map(result => result.value || result.reason),
+      availableEndpoints: healthResults.filter(result => 
+        (result.value || result.reason)?.status === 'available'
+      ).length,
+      totalEndpoints: endpoints.length
+    });
+  } catch (error) {
+    return NextResponse.json({
+      status: 'error',
+      error: error.message,
+      timestamp: new Date().toISOString()
+    }, { status: 500 });
   }
 }
 

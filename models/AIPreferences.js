@@ -36,10 +36,54 @@ const AIPreferenceSchema = new mongoose.Schema({
   citationStyle: {
     type: String,
     required: true
-  },
-  tokenPredictionLimit: {
+  },  tokenPredictionLimit: {
     type: Number,
     default: 30000  // Added default value
+  },
+  // RAG (Retrieval-Augmented Generation) Settings
+  ragSettings: {
+    enableRAG: {
+      type: Boolean,
+      default: true
+    },
+    ragSimilarityThreshold: {
+      type: Number,
+      default: 0.7,
+      min: 0.0,
+      max: 1.0
+    },
+    maxContextChunks: {
+      type: Number,
+      default: 5,
+      min: 1,
+      max: 20
+    },
+    chunkSize: {
+      type: Number,
+      default: 1000,
+      min: 100,
+      max: 4000
+    },
+    chunkOverlap: {
+      type: Number,
+      default: 200,
+      min: 0,
+      max: 1000
+    },
+    contextPriorityMode: {
+      type: String,
+      enum: ['automatic', 'semantic-only', 'uploads-only'],
+      default: 'automatic'
+    },
+    includeSourceAttribution: {
+      type: Boolean,
+      default: true
+    },
+    semanticSearchMode: {
+      type: String,
+      enum: ['conservative', 'moderate', 'aggressive'],
+      default: 'moderate'
+    }
   },
   processingRules: {
     removeSensitiveData: {

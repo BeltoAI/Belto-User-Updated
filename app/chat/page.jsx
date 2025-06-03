@@ -60,8 +60,7 @@ function ChatPageContent({ inputText, selectedFiles, isWideView, selectedModel }
     toggleDislike: handleToggleDislike,
   } = useMessageReactions(userId, currentSessionId, studentId);
   // Use our lecture context hook to get materials
-  const { lectureMaterials, isLoadingMaterials } = useLectureContext(lectureId, currentSessionId);
-  // Use our chat handlers with token and prompt tracking
+  const { lectureMaterials, isLoadingMaterials } = useLectureContext(lectureId, currentSessionId);  // Use our chat handlers with token and prompt tracking
   const { 
     handleNewMessage, 
     handleDelete, 
@@ -76,7 +75,8 @@ function ChatPageContent({ inputText, selectedFiles, isWideView, selectedModel }
     updateTokenUsage,
     clearInputs,
     aiPreferences,
-    lectureMaterials // Add this parameter
+    lectureMaterials,
+    lectureId // Add lectureId parameter for semantic search
   );
 
   const simpleBarRef = useRef(null);
@@ -330,7 +330,11 @@ function ChatPageContent({ inputText, selectedFiles, isWideView, selectedModel }
         </div>
       </SimpleBar>
       
-      <LectureMaterials materials={lectureMaterials} isLoading={isLoadingMaterials} />
+      <LectureMaterials 
+        materials={lectureMaterials} 
+        isLoading={isLoadingMaterials} 
+        lectureId={lectureId}
+      />
       
       <ChatInput
         handleSubmit={handleSubmit}

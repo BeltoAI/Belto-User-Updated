@@ -5,6 +5,17 @@ export const useAIResponse = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
 
+  // Helper function to create timeout signal with fallback
+  const createTimeoutSignal = (timeoutMs) => {
+    if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
+      return AbortSignal.timeout(timeoutMs);
+    }
+    // Fallback for older browsers
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), timeoutMs);
+    return controller.signal;
+  };
+
   const generateAIResponse = useCallback(async (
     prompt, 
     attachments = [], 
@@ -79,60 +90,90 @@ export const useAIResponse = () => {
       // If we have AI preferences, add them to the request
       if (aiPreferences) {
         requestBody.preferences = aiPreferences;
-      }
-
-      console.log("Sending AI request with history length:", formattedHistory.length);
+      }      console.log("Sending AI request with history length:", formattedHistory.length);
       console.log("Message count:", messageCount, "Limit:", aiPreferences?.numPrompts || "unspecified");
-      console.log("Token usage:", totalTokensUsed, "Limit:", aiPreferences?.tokenPredictionLimit || "unspecified");
-
-      const response = await fetch('/api/ai-proxy', {
+      console.log("Token usage:", totalTokensUsed, "Limit:", aiPreferences?.tokenPredictionLimit || "unspecified");      const response = await fetch('/api/ai-proxy', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(requestBody),
-      });
-
-      // Handle different error responses
+        signal: createTimeoutSignal(18000), // 18 seconds total timeout (shorter than AI proxy)
+      });// Handle different error responses
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
         console.error("AI proxy error:", response.status, errorData);
-        
-        // If this is potentially the first message (based on history length)
+          // If this is potentially the first message (based on history length)
         if (formattedHistory.length === 0 || messageCount === 0) {
           console.log("First message failed, attempting retry...");
           // Wait briefly then retry
-          await new Promise(resolve => setTimeout(resolve, 1000));
-          
-          const retryResponse = await fetch('/api/ai-proxy', {
+          await new Promise(resolve => setTimeout(resolve, 1500));
+            const retryResponse = await fetch('/api/ai-proxy', {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
             },
             body: JSON.stringify(requestBody),
+            signal: createTimeoutSignal(15000), // Shorter timeout for retry
           });
           
           if (retryResponse.ok) {
-            return await retryResponse.json();
+            const retryData = await retryResponse.json();
+            // Handle error responses that still return 200 but contain error info
+            if (retryData.isError) {
+              return {
+                response: retryData.response,
+                tokenUsage: retryData.tokenUsage || {
+                  total_tokens: 0,
+                  prompt_tokens: 0,
+                  completion_tokens: 0
+                },
+                isError: true
+              };
+            }
+            return retryData;
           }
         }
         
-        let errorMessage = errorData.error || 'Failed to generate AI response';
+        let errorMessage = errorData.error || `HTTP ${response.status}: Failed to generate AI response`;
         setError(errorMessage);
-        // Continue with existing error handling...
+          // Return a user-friendly fallback response
+        const fallbackMessages = [
+          "I apologize, but I'm experiencing technical difficulties. Please try again in a moment.",
+          "I'm currently unable to process your request. Please try rephrasing your question or try again later.",
+          "There seems to be a connectivity issue. Please check your connection and try again.",
+          "I'm temporarily unavailable due to high server load. Please try again shortly.",
+          "The AI service is currently experiencing delays. Please try again in a few moments."
+        ];
         
-        // Return a fallback response with the error message
+        const randomFallback = fallbackMessages[Math.floor(Math.random() * fallbackMessages.length)];
+        
         return {
-          response: `I apologize, but I encountered an error: ${errorMessage}`,
+          response: randomFallback,
           tokenUsage: {
             total_tokens: 0,
             prompt_tokens: 0,
             completion_tokens: 0
-          }
+          },
+          isError: true
         };
       }
 
       const data = await response.json();
+      
+      // Handle error responses that still return 200 but contain error info
+      if (data.isError) {
+        setError(data.errorDetails?.message || 'AI service error');
+        return {
+          response: data.response,
+          tokenUsage: data.tokenUsage || {
+            total_tokens: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0
+          },
+          isError: true
+        };
+      }
       
       // Check if the new response would exceed the token limit
       if (aiPreferences?.tokenPredictionLimit && 
@@ -234,9 +275,7 @@ export const useAIResponse = () => {
       const formattedHistory = previousMessages.map(msg => ({
         role: msg.isUser ? 'user' : 'assistant',
         content: msg.text || msg.content || msg.message || ''
-      }));
-      
-      // Now make the actual AI request with properly formatted message
+      }));      // Now make the actual AI request with properly formatted message
       const aiResponse = await fetch('/api/ai-proxy', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -250,6 +289,7 @@ export const useAIResponse = () => {
             { role: 'user', content: message }
           ]
         }),
+        signal: createTimeoutSignal(25000), // 25 seconds timeout
       });
       
       if (!aiResponse.ok) {

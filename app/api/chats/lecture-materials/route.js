@@ -1,4 +1,4 @@
-import connectToDatabase  from '@/lib/db';
+import connectDB from '@/lib/db';
 import { NextResponse } from 'next/server';
 import Lecture from '@/models/Lecture';
 export async function GET(request) {
@@ -10,7 +10,7 @@ export async function GET(request) {
             return NextResponse.json({ error: 'Lecture ID is required' }, { status: 400 });
         }
 
-        await connectToDatabase();
+        await connectDB();
 
         const lecture = await Lecture.findById(lectureId);
 

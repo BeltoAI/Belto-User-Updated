@@ -1,4 +1,20 @@
-{
+{  "functions": {
+    "app/api/ai-proxy/route.js": {
+      "maxDuration": 60
+    },
+    "app/api/chat/route.js": {
+      "maxDuration": 60
+    },
+    "app/api/chat-with-limits/route.js": {
+      "maxDuration": 60
+    },
+    "app/api/lectures/[lectureId]/materials/process/route.js": {
+      "maxDuration": 60
+    },
+    "app/api/lectures/[lectureId]/materials/search/route.js": {
+      "maxDuration": 30
+    }
+  },
   "rewrites": [
     {
       "source": "/api/belto-proxy/process_pdf_base64",

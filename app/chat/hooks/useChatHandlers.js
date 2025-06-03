@@ -3,8 +3,13 @@
 import { useCallback, useState, useEffect } from 'react';
 import { toast } from 'react-toastify';
 import { useAIResponse } from './useAIResponse';
+import { 
+  searchLectureMaterials, 
+  shouldTriggerSemanticSearch, 
+  formatSemanticResults 
+} from '../utils/semanticSearch';
 
-// Update the function signature to accept lectureMaterials
+// Update the function signature to accept lectureMaterials and lectureId
 export const useChatHandlers = (
   userId,
   currentSessionId,
@@ -14,7 +19,8 @@ export const useChatHandlers = (
   updateTokenUsage,
   clearInputs,
   aiPreferences, // Add AI preferences parameter
-  lectureMaterials = [] // Add this parameter
+  lectureMaterials = [], // Add this parameter
+  lectureId = null // Add lectureId for semantic search
 ) => {
   const [username, setUsername] = useState('User');
   const { generateAIResponse } = useAIResponse();
@@ -138,10 +144,12 @@ export const useChatHandlers = (
       const savedUserMessage = await userRes.json();
       setMessages(prev => prev.map(msg => 
         msg.id === userMessage.id ? { ...msg, _id: savedUserMessage._id } : msg
-      ));
-
-      // Check if the message is asking about a document in lecture materials
+      ));      // Check if the message is asking about a document in lecture materials
       const documentMentioned = findMentionedDocument(text, lectureMaterials);
+        // Check if we should trigger semantic search for this query
+      const shouldUseSemanticSearch = lectureId && 
+        shouldTriggerSemanticSearch(text, lectureMaterials, aiPreferences) && 
+        !attachment && !documentMentioned;
       
       // Format conversation history for the AI
       const conversationHistory = messages.map(msg => ({
@@ -154,12 +162,13 @@ export const useChatHandlers = (
       // Determine what to send as the prompt
       let promptToSend = text.trim();
       let attachmentsToSend = attachment ? [attachment] : [];
+      let semanticContext = null;
       
-      // If there's an uploaded attachment, use that
+      // If there's an uploaded attachment, use that (highest priority)
       if (attachment) {
         promptToSend = `${text.trim()}\n\nHere is the document content to analyze:\n${attachment.content}`;
       } 
-      // If user is asking about a lecture document and no attachment was uploaded
+      // If user is asking about a specific lecture document (medium priority)
       else if (documentMentioned) {
         promptToSend = `${text.trim()}\n\nHere is the document content to analyze:\n${documentMentioned.content}`;
         
@@ -169,6 +178,40 @@ export const useChatHandlers = (
           content: documentMentioned.content,
           type: documentMentioned.fileType || 'text/plain'
         }];
+      }
+      // If we should use semantic search for broader context (lower priority)
+      else if (shouldUseSemanticSearch) {        try {
+          console.log('Performing semantic search for query:', text);
+          
+          // Use AI preferences for search parameters
+          const ragSettings = aiPreferences?.ragSettings || {};
+          const searchResults = await searchLectureMaterials(lectureId, text, {
+            limit: ragSettings.maxContextChunks || 3,
+            minSimilarity: ragSettings.ragSimilarityThreshold || 0.6
+          }, aiPreferences);
+          
+          if (searchResults && searchResults.results && searchResults.results.length > 0) {
+            semanticContext = formatSemanticResults(searchResults, 2500, aiPreferences);
+            
+            if (semanticContext) {
+              promptToSend = `${text.trim()}\n\n${semanticContext.contextText}`;
+              
+              console.log(`Enhanced prompt with semantic context from ${semanticContext.totalChunks} chunks`);
+              
+              // Create virtual attachments for the context
+              attachmentsToSend = semanticContext.materialsUsed.map(material => ({
+                name: `${material.materialTitle} (AI Retrieved Context)`,
+                content: `Context chunks: ${material.chunksUsed}, Avg similarity: ${(material.similarities.reduce((a,b) => a+b, 0) / material.similarities.length).toFixed(3)}`,
+                type: 'semantic-context'
+              }));
+            }
+          } else {
+            console.log('No relevant semantic results found for query');
+          }
+        } catch (semanticError) {
+          console.error('Semantic search failed:', semanticError);
+          // Continue without semantic context - don't break the chat flow
+        }
       }
 
       const { response: aiResponse, tokenUsage: messageTokenUsage } = 
