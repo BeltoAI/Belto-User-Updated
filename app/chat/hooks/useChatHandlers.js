@@ -146,9 +146,10 @@ export const useChatHandlers = (
         msg.id === userMessage.id ? { ...msg, _id: savedUserMessage._id } : msg
       ));      // Check if the message is asking about a document in lecture materials
       const documentMentioned = findMentionedDocument(text, lectureMaterials);
-        // Check if we should trigger semantic search for this query
+      
+      // Check if we should trigger semantic search for this query
       const shouldUseSemanticSearch = lectureId && 
-        shouldTriggerSemanticSearch(text, lectureMaterials, aiPreferences) && 
+        shouldTriggerSemanticSearch(text, lectureMaterials) && 
         !attachment && !documentMentioned;
       
       // Format conversation history for the AI
@@ -180,18 +181,16 @@ export const useChatHandlers = (
         }];
       }
       // If we should use semantic search for broader context (lower priority)
-      else if (shouldUseSemanticSearch) {        try {
+      else if (shouldUseSemanticSearch) {
+        try {
           console.log('Performing semantic search for query:', text);
-          
-          // Use AI preferences for search parameters
-          const ragSettings = aiPreferences?.ragSettings || {};
           const searchResults = await searchLectureMaterials(lectureId, text, {
-            limit: ragSettings.maxContextChunks || 3,
-            minSimilarity: ragSettings.ragSimilarityThreshold || 0.6
-          }, aiPreferences);
+            limit: 3,
+            minSimilarity: 0.6
+          });
           
           if (searchResults && searchResults.results && searchResults.results.length > 0) {
-            semanticContext = formatSemanticResults(searchResults, 2500, aiPreferences);
+            semanticContext = formatSemanticResults(searchResults, 2500);
             
             if (semanticContext) {
               promptToSend = `${text.trim()}\n\n${semanticContext.contextText}`;
@@ -212,14 +211,14 @@ export const useChatHandlers = (
           console.error('Semantic search failed:', semanticError);
           // Continue without semantic context - don't break the chat flow
         }
-      }
-
-      const { response: aiResponse, tokenUsage: messageTokenUsage } = 
+      }      const { response: aiResponse, tokenUsage: messageTokenUsage } = 
         await generateAIResponse(
           promptToSend,
           attachmentsToSend,
           conversationHistory,
-          aiPreferences 
+          aiPreferences,
+          totalPrompts + 1, // message count
+          lectureId // Pass lectureId for RAG context
         );
 
       const botMessage = {

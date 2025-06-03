@@ -6,9 +6,7 @@ import Lecture from '@/models/Lecture';
 // Helper function to extract text from URL-based files
 async function extractTextFromUrl(fileUrl, fileType) {
   try {
-    const response = await fetch(fileUrl, {
-      signal: AbortSignal.timeout(20000) // 20 second timeout for file fetch
-    });
+    const response = await fetch(fileUrl);
     if (!response.ok) {
       throw new Error(`Failed to fetch file: ${response.statusText}`);
     }
@@ -19,17 +17,15 @@ async function extractTextFromUrl(fileUrl, fileType) {
 
     // Use the same extraction APIs as the client-side processing
     let extractedText = '';
-    const baseUrl = process.env.NEXTAUTH_URL || 'https://belto.vercel.app';
 
     if (fileType === 'application/pdf' || fileUrl.toLowerCase().endsWith('.pdf')) {
-      const extractResponse = await fetch(`${baseUrl}/api/belto-proxy/process_pdf_base64`, {
+      const extractResponse = await fetch(`${process.env.NEXTAUTH_URL}/api/belto-proxy/process_pdf_base64`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'API-Key': process.env.BELTO_API_KEY || '123456789012345'
         },
-        body: JSON.stringify({ file_base64: base64 }),
-        signal: AbortSignal.timeout(30000) // 30 second timeout for PDF processing
+        body: JSON.stringify({ file_base64: base64 })
       });
 
       if (extractResponse.ok) {
@@ -38,14 +34,13 @@ async function extractTextFromUrl(fileUrl, fileType) {
       }
     } else if (fileType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || 
                fileUrl.toLowerCase().endsWith('.docx')) {
-      const extractResponse = await fetch(`${baseUrl}/api/belto-proxy/process_docx_base64`, {
+      const extractResponse = await fetch(`${process.env.NEXTAUTH_URL}/api/belto-proxy/process_docx_base64`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           'API-Key': process.env.BELTO_API_KEY || '123456789012345'
         },
-        body: JSON.stringify({ file_base64: base64 }),
-        signal: AbortSignal.timeout(30000) // 30 second timeout for DOCX processing
+        body: JSON.stringify({ file_base64: base64 })
       });
 
       if (extractResponse.ok) {
@@ -112,16 +107,13 @@ function chunkText(text, chunkSize = 1000, overlap = 200) {
 // Helper function to generate embeddings
 async function generateEmbeddings(texts) {
   try {
-    // Use the Vercel proxy endpoint
-    const baseUrl = process.env.NEXTAUTH_URL || 'https://belto.vercel.app';
-    const response = await fetch(`${baseUrl}/api/belto-proxy/embed`, {
+    const response = await fetch(`${process.env.BELTO_EMBEDDINGS_API_URL}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': process.env.BELTO_EMBEDDINGS_API_KEY || '123456789012345'
       },
-      body: JSON.stringify({ text: texts }),
-      signal: AbortSignal.timeout(30000) // 30 second timeout
+      body: JSON.stringify({ text: texts })
     });
 
     if (!response.ok) {
@@ -262,11 +254,11 @@ export async function PUT(request, { params }) {
 
     const results = [];
     let successCount = 0;
-    let errorCount = 0;    // Process each material
+    let errorCount = 0;
+
+    // Process each material
     for (const material of lecture.materials) {
       try {
-        console.log(`Processing material: ${material.title} (ID: ${material._id})`);
-        
         // Check if already processed
         if (!force) {
           const existingChunks = await LectureMaterialChunk.findOne({ 
@@ -284,31 +276,22 @@ export async function PUT(request, { params }) {
           }
         }
 
-        // Validate material has required properties
-        if (!material.fileUrl) {
-          throw new Error('Material missing file URL');
-        }
-
-        if (!material.fileType) {
-          throw new Error('Material missing file type');
-        }
-
         // Process the material (same logic as POST)
         const extractedText = await extractTextFromUrl(material.fileUrl, material.fileType);
-        if (!extractedText || extractedText.trim().length === 0) {
-          throw new Error('No text content extracted from material');
+        if (!extractedText) {
+          throw new Error('No text content extracted');
         }
 
         const chunks = chunkText(extractedText, 1000, 200);
         if (chunks.length === 0) {
-          throw new Error('No chunks generated from extracted text');
+          throw new Error('No chunks generated');
         }
 
         const chunkTexts = chunks.map(chunk => chunk.content);
         const embeddings = await generateEmbeddings(chunkTexts);
 
         if (embeddings.length !== chunks.length) {
-          throw new Error(`Embeddings count mismatch: expected ${chunks.length}, got ${embeddings.length}`);
+          throw new Error('Embeddings count mismatch');
         }
 
         // Remove existing chunks if force
@@ -353,7 +336,7 @@ export async function PUT(request, { params }) {
           materialId: material._id.toString(),
           materialTitle: material.title,
           status: 'error',
-          error: error.message || 'Unknown processing error'
+          error: error.message
         });
         errorCount++;
       }

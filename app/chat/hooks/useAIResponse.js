@@ -4,7 +4,6 @@ import { useCallback, useState } from 'react';
 export const useAIResponse = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
-
   // Helper function to create timeout signal with fallback
   const createTimeoutSignal = (timeoutMs) => {
     if (typeof AbortSignal !== 'undefined' && AbortSignal.timeout) {
@@ -16,12 +15,44 @@ export const useAIResponse = () => {
     return controller.signal;
   };
 
+  // Helper function to determine appropriate timeout based on request characteristics
+  const determineRequestTimeout = (attachments, prompt, lectureId) => {
+    // Check for file attachments (highest priority - file summarization)
+    const hasAttachments = attachments && attachments.length > 0;
+    const hasAttachmentContent = prompt && (
+      prompt.includes('Attached document content:') || 
+      prompt.includes('document content to analyze:')
+    );
+    
+    // Check for large content
+    const totalContentLength = prompt ? prompt.length : 0;
+    
+    // Check for RAG context
+    const hasRAGContext = !!lectureId;
+
+    if (hasAttachments || hasAttachmentContent) {
+      console.log('Frontend: File summarization detected - using 50 second timeout');
+      return 50000; // 50 seconds for file summarization
+    } else if (hasRAGContext && totalContentLength > 5000) {
+      console.log('Frontend: Large RAG request detected - using 35 second timeout');
+      return 35000; // 35 seconds for large RAG requests
+    } else if (hasRAGContext) {
+      console.log('Frontend: RAG request detected - using 25 second timeout');
+      return 25000; // 25 seconds for RAG requests
+    } else if (totalContentLength > 5000) {
+      console.log('Frontend: Large content detected - using 30 second timeout');
+      return 30000; // 30 seconds for large content
+    } else {
+      return 15000; // 15 seconds for regular requests
+    }
+  };
   const generateAIResponse = useCallback(async (
     prompt, 
     attachments = [], 
     previousMessages = [], 
     aiPreferences = null,
-    messageCount = 0
+    messageCount = 0,
+    lectureId = null // Add lectureId parameter
   ) => {
     setIsLoading(true);
     setError(null);
@@ -90,31 +121,47 @@ export const useAIResponse = () => {
       // If we have AI preferences, add them to the request
       if (aiPreferences) {
         requestBody.preferences = aiPreferences;
+      }
+
+      // Add lectureId and authToken for RAG context
+      if (lectureId) {
+        requestBody.lectureId = lectureId;
+        requestBody.authToken = localStorage.getItem('token');
       }      console.log("Sending AI request with history length:", formattedHistory.length);
       console.log("Message count:", messageCount, "Limit:", aiPreferences?.numPrompts || "unspecified");
-      console.log("Token usage:", totalTokensUsed, "Limit:", aiPreferences?.tokenPredictionLimit || "unspecified");      const response = await fetch('/api/ai-proxy', {
+      console.log("Token usage:", totalTokensUsed, "Limit:", aiPreferences?.tokenPredictionLimit || "unspecified");
+
+      // Determine appropriate timeout based on request characteristics
+      const requestTimeout = determineRequestTimeout(attachments, requestBody.prompt, lectureId);
+      console.log(`Frontend: Using ${requestTimeout}ms timeout for this request`);
+
+      const response = await fetch('/api/ai-proxy', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(requestBody),
-        signal: createTimeoutSignal(18000), // 18 seconds total timeout (shorter than AI proxy)
+        signal: createTimeoutSignal(requestTimeout),
       });// Handle different error responses
       if (!response.ok) {
         const errorData = await response.json().catch(() => ({}));
         console.error("AI proxy error:", response.status, errorData);
           // If this is potentially the first message (based on history length)
-        if (formattedHistory.length === 0 || messageCount === 0) {
-          console.log("First message failed, attempting retry...");
+        if (formattedHistory.length === 0 || messageCount === 0) {          console.log("First message failed, attempting retry...");
           // Wait briefly then retry
           await new Promise(resolve => setTimeout(resolve, 1500));
-            const retryResponse = await fetch('/api/ai-proxy', {
+          
+          // Use shorter timeout for retry (75% of original timeout, minimum 12 seconds)
+          const retryTimeout = Math.max(12000, Math.floor(requestTimeout * 0.75));
+          console.log(`Frontend: Using ${retryTimeout}ms timeout for retry`);
+          
+          const retryResponse = await fetch('/api/ai-proxy', {
             method: 'POST',
             headers: {
               'Content-Type': 'application/json',
             },
             body: JSON.stringify(requestBody),
-            signal: createTimeoutSignal(15000), // Shorter timeout for retry
+            signal: createTimeoutSignal(retryTimeout),
           });
           
           if (retryResponse.ok) {
@@ -285,11 +332,13 @@ export const useAIResponse = () => {
           preferences,
           history: formattedHistory,
           messageCount,
+          lectureId, // Include lectureId for RAG context
+          authToken: localStorage.getItem('token'), // Include auth token
           messages: [
             { role: 'user', content: message }
           ]
         }),
-        signal: createTimeoutSignal(25000), // 25 seconds timeout
+        signal: createTimeoutSignal(20000), // 20 seconds timeout
       });
       
       if (!aiResponse.ok) {

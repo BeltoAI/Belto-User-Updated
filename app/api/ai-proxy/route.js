@@ -18,7 +18,9 @@ const endpointStats = endpoints.map(url => ({
   consecutiveFailures: 0
 }));
 
-const TIMEOUT_MS = 15000; // 15 seconds timeout (optimized for Vercel free tier)
+const TIMEOUT_MS = 12000; // 12 seconds timeout (optimized for Vercel free tier)
+const FILE_SUMMARIZATION_TIMEOUT_MS = 45000; // 45 seconds for file summarization requests
+const LARGE_CONTENT_TIMEOUT_MS = 30000; // 30 seconds for requests with large content
 const MAX_CONSECUTIVE_FAILURES = 2; // Number of failures before marking endpoint as unavailable
 const RETRY_INTERVAL_MS = 15000; // Try unavailable endpoints again after 15 seconds
 const HEALTH_CHECK_THRESHOLD = 60000; // 1 minute for faster response (Vercel optimized)
@@ -157,12 +159,124 @@ function initializeHealthCheck() {
 // Initialize on module load
 initializeHealthCheck();
 
+/**
+ * Determines if the request is a file summarization request and returns appropriate timeout
+ * @param {Object} body - The request body
+ * @returns {Object} Timeout configuration with timeout value and request type
+ */
+function determineRequestTimeout(body) {
+  const requestInfo = {
+    timeout: TIMEOUT_MS,
+    type: 'regular',
+    reason: 'Standard AI request'
+  };
+
+  // Check for file attachments in various formats
+  const hasAttachments = body.attachments && Array.isArray(body.attachments) && body.attachments.length > 0;
+  const hasAttachmentsInPrompt = body.prompt && body.prompt.includes('Attached document content:');
+  const hasAttachmentsInMessage = body.message && body.message.includes('document content to analyze:');
+  
+  // Check for RAG context (lecture materials)
+  const hasRAGContext = body.lectureId && body.authToken;
+  
+  // Calculate total content length
+  let totalContentLength = 0;
+  if (body.prompt) totalContentLength += body.prompt.length;
+  if (body.message) totalContentLength += body.message.length;
+  if (body.messages && Array.isArray(body.messages)) {
+    totalContentLength += body.messages.reduce((total, msg) => total + (msg.content?.length || 0), 0);
+  }
+  if (body.history && Array.isArray(body.history)) {
+    totalContentLength += body.history.reduce((total, msg) => total + (msg.content?.length || 0), 0);
+  }
+
+  // Detect file summarization scenarios (highest priority timeout)
+  if (hasAttachments || hasAttachmentsInPrompt || hasAttachmentsInMessage) {
+    requestInfo.timeout = FILE_SUMMARIZATION_TIMEOUT_MS;
+    requestInfo.type = 'file_summarization';
+    requestInfo.reason = 'Request contains file attachments for summarization';
+    console.log(`File summarization detected - using ${FILE_SUMMARIZATION_TIMEOUT_MS}ms timeout`);
+  }
+  // Detect RAG requests with potential large context
+  else if (hasRAGContext) {
+    requestInfo.timeout = LARGE_CONTENT_TIMEOUT_MS;
+    requestInfo.type = 'rag_enhanced';
+    requestInfo.reason = 'Request includes RAG context from lecture materials';
+    console.log(`RAG-enhanced request detected - using ${LARGE_CONTENT_TIMEOUT_MS}ms timeout`);
+  }
+  // Detect large content requests
+  else if (totalContentLength > 5000) {
+    requestInfo.timeout = LARGE_CONTENT_TIMEOUT_MS;
+    requestInfo.type = 'large_content';
+    requestInfo.reason = `Request has large content (${totalContentLength} chars)`;
+    console.log(`Large content detected (${totalContentLength} chars) - using ${LARGE_CONTENT_TIMEOUT_MS}ms timeout`);
+  }
+
+  return requestInfo;
+}
+
+/**
+ * Fetches chat context (lecture attachments) for RAG enhancement
+ * @param {string} lectureId - The lecture ID to fetch context for
+ * @param {string} authToken - JWT token for authentication
+ * @param {Request} request - The original request object to get the origin
+ * @param {number} timeout - Timeout in milliseconds (default 5000)
+ * @returns {Promise<Object|null>} Chat context data or null if failed
+ */
+async function fetchChatContext(lectureId, authToken, request, timeout = 5000) {
+  if (!lectureId || !authToken) {
+    return null;
+  }
+
+  try {
+    // Use the current request's origin for internal API calls
+    const url = new URL(request.url);
+    const baseUrl = `${url.protocol}//${url.host}`;
+    
+    // Create timeout for RAG context fetch with configurable timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    
+    console.log(`Fetching RAG context with ${timeout}ms timeout for lecture: ${lectureId}`);
+    
+    const response = await fetch(`${baseUrl}/api/chat-context?lectureId=${lectureId}`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${authToken}`,
+        'Content-Type': 'application/json',
+      },
+      signal: controller.signal
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      console.log(`Failed to fetch chat context: ${response.status}`);
+      return null;
+    }
+
+    const data = await response.json();
+    return data.success ? data : null;
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      console.log(`RAG context fetch timed out after ${timeout}ms - continuing without context`);
+    } else {
+      console.log(`Error fetching chat context: ${error.message}`);
+    }
+    return null;
+  }
+}
+
 export async function POST(request) {
   console.log('POST request received to AI proxy');
 
   try {
     const body = await request.json();
     console.log('Request body structure:', Object.keys(body));
+
+    // Determine request type and appropriate timeout
+    const requestConfig = determineRequestTimeout(body);
+    console.log(`Request type: ${requestConfig.type}, Timeout: ${requestConfig.timeout}ms, Reason: ${requestConfig.reason}`);
 
     // Get API key from environment variables
     const apiKey = process.env.AI_API_KEY;
@@ -222,40 +336,54 @@ export async function POST(request) {
       if (!isDuplicate) {
         messages.push(newUserMessage);
       }
-    }
-
-    // Make sure all messages have the required 'content' field
+    }    // Make sure all messages have the required 'content' field
     messages = messages.map(msg => {
       if (!msg.content && msg.message) {
         return { ...msg, content: msg.message };
       }
       return msg;
-    });
-
-    // Add system message if preferences contains it
+    });    // Fetch RAG context if lectureId and authToken are provided
+    let ragContext = null;
+    if (body.lectureId && body.authToken) {
+      console.log(`Fetching RAG context for lecture: ${body.lectureId}`);
+      // Use longer timeout for file summarization and large content requests
+      const ragTimeout = requestConfig.type === 'file_summarization' ? 10000 : 
+                        requestConfig.type === 'large_content' ? 8000 : 5000;
+      ragContext = await fetchChatContext(body.lectureId, body.authToken, request, ragTimeout);
+      if (ragContext) {
+        console.log(`RAG context fetched: ${ragContext.lectureTitle}, ${ragContext.attachments?.length || 0} attachments`);
+      }
+    }// Add system message if preferences contains it
     let systemMessageAdded = false;
+    let baseSystemPrompt = '';
    
     if (body.preferences?.systemPrompts && body.preferences.systemPrompts.length > 0) {
-      messages.unshift({
-        role: 'system',
-        content: body.preferences.systemPrompts[0].content
-      });
-      systemMessageAdded = true;
+      baseSystemPrompt = body.preferences.systemPrompts[0].content;
     } else if (body.aiConfig?.systemPrompts && body.aiConfig.systemPrompts.length > 0) {
-      messages.unshift({
-        role: 'system',
-        content: body.aiConfig.systemPrompts[0].content
-      });
-      systemMessageAdded = true;
+      baseSystemPrompt = body.aiConfig.systemPrompts[0].content;
+    } else {
+      baseSystemPrompt = 'You are a helpful AI assistant named BELTO. Use previous conversation history to maintain context.';
+    }    // Enhance system prompt with RAG context if available
+    if (ragContext && ragContext.attachments && ragContext.attachments.length > 0) {
+      // Limit context to prevent token overflow - max 2000 characters per attachment
+      const maxContextPerAttachment = 2000;
+      const contextContent = ragContext.attachments
+        .slice(0, 3) // Limit to 3 attachments maximum
+        .map(att => {
+          const truncatedContent = att.content.length > maxContextPerAttachment 
+            ? att.content.substring(0, maxContextPerAttachment) + '...[truncated]'
+            : att.content;
+          return `Document: ${att.name}\nContent: ${truncatedContent}`;
+        })
+        .join('\n\n');
+      
+      baseSystemPrompt += `\n\nYou have access to the following course materials from "${ragContext.lectureTitle}" (Lecture ID: ${ragContext.lectureId}):\n\n${contextContent}\n\nWhen answering questions, prioritize information from these course materials when relevant. If your response includes information from these materials, briefly mention which document you're referencing.`;
     }
-   
-    // Add default system message if none provided
-    if (!systemMessageAdded) {
-      messages.unshift({
-        role: 'system',
-        content: 'You are a helpful AI assistant named BELTO. Use previous conversation history to maintain context.'
-      });
-    }
+
+    messages.unshift({
+      role: 'system',
+      content: baseSystemPrompt
+    });
 
     // Ensure each message has content and remove any empty messages
     const validMessages = messages.filter(msg => msg.content);
@@ -290,16 +418,16 @@ export async function POST(request) {
         // Select the best endpoint using our load balancing algorithm
         const selectedEndpoint = selectEndpoint();
         console.log(`Attempt ${attemptCount}: Selected endpoint ${selectedEndpoint}`);
-        
-        // Start timing the request for performance tracking
+          // Start timing the request for performance tracking
         const requestStartTime = Date.now();
 
-        // Create abort controller for manual timeout control
+        // Create abort controller for manual timeout control with dynamic timeout
+        const dynamicTimeout = requestConfig.timeout;
         const controller = new AbortController();
         const timeoutId = setTimeout(() => {
           controller.abort();
-          console.log(`Request timeout after ${TIMEOUT_MS}ms for ${selectedEndpoint}`);
-        }, TIMEOUT_MS);
+          console.log(`Request timeout after ${dynamicTimeout}ms for ${selectedEndpoint} (${requestConfig.type} request)`);
+        }, dynamicTimeout);
 
         // Make the AI API call with API key in headers
         const response = await axios.post(
@@ -310,7 +438,7 @@ export async function POST(request) {
               'Content-Type': 'application/json',
               'Authorization': `Bearer ${apiKey}`,
             },
-            timeout: TIMEOUT_MS,
+            timeout: dynamicTimeout,
             signal: controller.signal,
           }
         );

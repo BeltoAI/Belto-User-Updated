@@ -6,16 +6,13 @@ import Lecture from '@/models/Lecture';
 // Helper function to generate query embedding
 async function generateQueryEmbedding(query) {
   try {
-    // Use the Vercel proxy endpoint
-    const baseUrl = process.env.NEXTAUTH_URL || 'https://belto.vercel.app';
-    const response = await fetch(`${baseUrl}/api/belto-proxy/embed`, {
+    const response = await fetch(`${process.env.BELTO_EMBEDDINGS_API_URL}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': process.env.BELTO_EMBEDDINGS_API_KEY || '123456789012345'
       },
-      body: JSON.stringify({ text: [query] }),
-      signal: AbortSignal.timeout(15000) // 15 second timeout
+      body: JSON.stringify({ text: [query] })
     });
 
     if (!response.ok) {
