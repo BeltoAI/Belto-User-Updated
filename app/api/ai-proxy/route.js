@@ -2,8 +2,8 @@ import { NextResponse } from 'next/server';
 import axios from 'axios';
 
 const endpoints = [
-  'http://47.34.185.47:9999/v1/chat/completions',
-  'http://belto.myftp.biz:9999/v1/chat/completions'
+  'http://belto.myftp.biz:9999/v1/chat/completions',
+  'http://belto.myftp.biz:9998/v1/chat/completions'
 ];
 
 // 'http://97.90.195.162:9999/v1/chat/completions',
